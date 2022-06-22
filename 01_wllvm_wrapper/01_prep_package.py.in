@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+import glob
+import os
+import os.path
+import argparse
+import re
+import subprocess
+import shutil
+import sys
+from datetime import datetime
+
+# get the of location of script
+ampfuzz_bin = os.path.dirname(os.path.realpath(__file__))
+cc_bin = os.path.join(ampfuzz_bin, 'pre_clang')
+cxx_bin = os.path.join(ampfuzz_bin, 'pre_clang++')
+compiler_export_regex = re.compile(r'^export\s+(CC|CXX)\s*=.*')
+changelog_version_regex = re.compile(r'^(?P<pkgname>.*) \((.*:)?(?P<upstream_version>.*)\) (?P<remainder>.*)$')
+dpkg_parsechangelog = re.compile(r'(dpkg-parsechangelog)(\s+\|)')
+ampfuzz_var = '/var/ampfuzz'
+
+# get the environment ready
+
+EXTRA_ENV = {
+    'DEBIAN_FRONTEND': 'noninteractive',
+    'DEB_BUILD_OPTIONS': 'nocheck',
+    'CFLAGS': ' -I/usr/include/tirpc',
+    'CC': cc_bin,
+    'CXX': cxx_bin,
+    'LLVM_COMPILER': 'clang',
+    'LLVM_CC_NAME': 'clang',
+    'LLVM_CXX_NAME': 'clang++',
+    'LLVM_CPP_NAME': 'clang-cpp',
+    'LLVM_COMPILER_PATH': '@LLVM_COMPILER_PATH@',
+}
+
+my_env = os.environ.copy()
+my_env.update(EXTRA_ENV)
+my_env['PATH'] = f"{EXTRA_ENV['LLVM_COMPILER_PATH']}:{my_env['PATH']}"
+
+
+def dparser():
+    par = argparse.ArgumentParser(
+        description='fuzz_package expects a debian package name binary name together with path using debian as root, examples are in ranked_packages.json')
+    par.add_argument('-v', '--version', type=str, help='Package version')
+    par.add_argument('-f', '--force', action='store_true', help='Force rebuild')
+    par.add_argument('name', type=str, help='Package name')
+    return par
+
+
+def symlink(link, target, backup=True):
+    if backup and os.path.exists(link):
+        exec_command('cp', [link, link + ".bak"])
+    exec_command('ln', ['-sf', target, link], None)
+    if os.path.realpath(link) == target:
+        print("Success link for: " + link + "->" + target)
+    else:
+        print("Failure link for: " + link + "->" + target)
+
+
+def unsymlink(link):
+    if os.path.exists(link):
+        exec_command('rm', [link])
+    if os.path.exists(link + '.bak'):
+        exec_command('mv', [link + ".bak", link])
+
+
+def exec_command(name, options, input=None, asuser=None, allow_fail=False):
+    command = []
+    cmd_env = my_env
+    if asuser is not None:
+        command.append('sudo')
+        command.append('-E')
+        command.append('-u')
+        command.append(asuser)
+        command.append('--')
+        cmd_env = cmd_env.copy()
+        cmd_env['HOME'] = os.path.expanduser(f'~{asuser}')
+    command.append(name)
+    command.extend(options)
+    if input is not None:
+        command.append(input)
+
+    print(command)
+
+    try:
+        subprocess.check_call(command,
+                              stdin=sys.stdin.fileno(),
+                              stdout=sys.stdout.fileno(),
+                              stderr=sys.stderr.fileno(),
+                              env=cmd_env)
+    except subprocess.CalledProcessError as e:
+        if not allow_fail:
+            raise e
+
+
+def prepare(pkg_build_dir, package, version=None):
+    exec_command('mkdir', ['-p', pkg_build_dir])
+    exec_command('chown', ['-R', 'user', pkg_build_dir])
+    # change the working directory to examples
+    os.chdir(pkg_build_dir)
+
+    # update package cache
+    exec_command('apt-get', ['update', '-y'])
+
+    # remove the package
+    exec_command('apt-get', ['remove', '-y'], package)
+
+    # get build dependencies
+    exec_command('apt-get', ['build-dep', '-y'], package)
+
+    # get package's sources
+    if version is not None:
+        query = f"{package}={version}"
+    else:
+        query = f"{package}"
+    exec_command('apt-get', ['source'], query, asuser='user')
+
+
+def mod_rules():
+    rules_file = 'rules'
+    rules_file_bak = f'{rules_file}.bak'
+
+    if not os.path.exists(rules_file_bak):
+        shutil.copy2(rules_file, rules_file_bak)
+
+    skip_rule = False
+
+    with open(rules_file_bak) as in_rules, open(rules_file, 'w') as out_rules:
+        for line in in_rules:
+            if line.startswith('override_dh_missing:'):
+                skip_rule = True
+            elif compiler_export_regex.match(line):
+                skip_rule = True
+            elif not line.startswith('\t'):
+                skip_rule = False
+
+            # prevent dumb packages from parsing our modified version number
+            line = dpkg_parsechangelog.sub('\\1 | sed \'s/999://\'\\2', line)
+
+            if not skip_rule:
+                out_rules.write(line)
+
+        out_rules.write('\noverride_dh_missing:\n')
+        out_rules.write('\t# DISABLED BY AMPFUZZ\n')
+
+
+def mod_changelog():
+    changelog_file = 'changelog'
+    changelog_file_bak = f'{changelog_file}.bak'
+
+    if not os.path.exists(changelog_file_bak):
+        shutil.copy2(changelog_file, changelog_file_bak)
+
+    with open(changelog_file) as f:
+        changelog = f.read()
+
+    for line in changelog.splitlines():
+        match = changelog_version_regex.match(line)
+        if match:
+            break
+
+    with open(changelog_file, 'w') as f:
+        f.write(f"""{match['pkgname']} (999:{match['upstream_version']}) {match['remainder']}
+
+  * AmpFuzz Instrumentation
+
+ -- Amp Fuzz <ampfuzz@ampfuzz>  {datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S +0000')}
+""")
+        f.write(changelog)
+
+
+def fix_symlinks():
+    symlink('/usr/bin/clang', cc_bin)
+    symlink('/usr/bin/gcc-10', cc_bin)
+    symlink('/usr/bin/gcc', cc_bin)
+    symlink('/usr/bin/clang++', cxx_bin)
+    symlink('/usr/bin/g++', cxx_bin)
+    symlink('/usr/bin/g++-10', cxx_bin)
+    symlink('/usr/bin/cpp-10', '/usr/bin/clang-cpp-11')
+    symlink('/usr/bin/cpp', '/usr/bin/clang-cpp-11')
+
+
+def rollback_symlinks():
+    unsymlink('/usr/bin/clang')
+    unsymlink('/usr/bin/gcc')
+    unsymlink('/usr/bin/clang++')
+    unsymlink('/usr/bin/g++')
+    unsymlink('/usr/bin/gcc-10')
+    unsymlink('/usr/bin/g++-10')
+    unsymlink('/usr/bin/cpp-10')
+    unsymlink('/usr/bin/cpp')
+
+
+def find_source_dir(pkg_build_dir):
+    '''
+    find source directory by looking for debian/changelog
+    the same way as debuild would
+    :param pkg_build_dir:
+    :return:
+    '''
+    path = ''
+    depth = 0
+    for root, dirs, files in os.walk(pkg_build_dir):
+        curr_depth = root[len(pkg_build_dir):].count(os.sep)
+        if os.path.basename(root) == 'debian' and 'changelog' in files:
+            if not depth == 0:
+                if curr_depth < depth:
+                    depth = curr_depth
+                    path = root
+            else:
+                depth = curr_depth
+                path = root
+    if path:
+        return path
+    raise ValueError("could not find source dir")
+
+
+def build(pkg_build_dir, package):
+    source_dir = find_source_dir(pkg_build_dir)
+    os.chdir(source_dir)
+    # modify rules
+    mod_rules()
+    # modify changelog
+    mod_changelog()
+    # build the package with modified rules
+    exec_command('debuild', ['--preserve-env', '-ePATH', '--no-lintian', '-rsudo', '-b', '-uc', '-us'], asuser='user')
+
+    # create Packages file to local repository
+    os.chdir(pkg_build_dir)
+    subprocess.check_call('apt-ftparchive packages . > Packages && gzip < Packages > Packages.gz', shell=True)
+
+
+def main():
+    # from IPython import embed; embed()
+    # get the arg
+    parser = dparser()
+    args = parser.parse_args()
+    package = args.name
+    version = args.version or None
+
+    # remove the package, get its sources and build dependencies
+    pkg_build_dir = os.path.join(ampfuzz_var, 'pkg_build', package)
+
+    packages_file = os.path.join(pkg_build_dir, 'Packages')
+
+    if (not os.path.exists(pkg_build_dir) or
+            args.force or
+            not os.path.exists(packages_file) or
+            os.path.getsize(packages_file) == 0):
+        print(f'(Re-)building package {package}')
+        prepare(pkg_build_dir, package, version)
+
+        fix_symlinks()
+
+        build(pkg_build_dir, package)
+
+        rollback_symlinks()
+
+
+if __name__ == '__main__':
+    main()

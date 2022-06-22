@@ -1,0 +1,15 @@
+[package]
+name = "runtime_common"
+version = "0.1.0"
+authors = ["Johannes Krupp <johannes.krupp@cispa.saarland>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+angora_common = { path = "../common" }
+libc = "0.2"
+log = "0.4"
+pretty_env_logger = "0.3"
+lazy_static = "1.1"
+ctor = "0.1.9"

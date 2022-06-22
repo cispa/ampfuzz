@@ -1,0 +1,8 @@
+# <output_directory> <timeout> [extra_args ...]
+24h 24h
+1h_10ms 1h -a=--disable_listen_ready -a=--early_termination=none -a=--startup_time_limit=10000 -a=--response_time_limit=10000
+1h_50ms 1h -a=--disable_listen_ready -a=--early_termination=none -a=--startup_time_limit=50000 -a=--response_time_limit=50000
+1h_100ms 1h -a=--disable_listen_ready -a=--early_termination=none -a=--startup_time_limit=100000 -a=--response_time_limit=100000
+1h_500ms 1h -a=--disable_listen_ready -a=--early_termination=none -a=--startup_time_limit=500000 -a=--response_time_limit=500000
+1h_1000ms 1h -a=--disable_listen_ready -a=--early_termination=none -a=--startup_time_limit=1000000 -a=--response_time_limit=1000000
+1h_no_amp 1h -a=--disable_amp_mutation -a=--disable_exploitation

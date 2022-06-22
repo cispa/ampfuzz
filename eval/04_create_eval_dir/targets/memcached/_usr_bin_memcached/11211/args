@@ -1,0 +1,1 @@
+-u root -p 0 -U 11211 -t 1 -o no_lru_maintainer,no_lru_crawler

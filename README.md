@@ -1,106 +1,68 @@
-# ParmeSan: Sanitizer-guided Greybox Fuzzing
+# AMPFUZZ: Fuzzing for Amplification DDoS Vulnerabilities
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+## Requirements
+* [docker](https://www.docker.com)
+* python3
 
-ParmeSan is a sanitizer-guided greybox fuzzer based on
-[Angora](https://github.com/AngoraFuzzer/Angora).
-
-## Published Work
-
-USENIX Security 2020: [ParmeSan: Sanitizer-guided Greybox Fuzzing](https://www.usenix.org/conference/usenixsecurity20/presentation/osterlund).
-
-The paper can be found here: [ParmeSan: Sanitizer-guided Greybox Fuzzing](https://download.vusec.net/papers/parmesan_sec20.pdf)
-
-
-## Building ParmeSan
-See the instructions for [Angora](https://github.com/AngoraFuzzer).
-
-Basically run the following scripts to install the dependencies and build ParmeSan:
+## Usage
+ 
+### 1. Build docker base images
+from the project directory, run
 ```bash
-build/install_rust.sh
-PREFIX=/path/to/install/llvm build/install_llvm.sh
-build/install_tools.sh
-build/build.sh
+make
 ```
 
-ParmeSan also builds a tool `bin/llvm-diff-parmesan`, which can be used for target
-acquisition.
+This will take some time and build four docker images:
+* `ampfuzz:base`: serves as the base-image for the other three stages, basically a Ubuntu 20.10 image with some packages installed and including a copy of the llvm source.
+* `ampfuzz:wllvm_wrapper`: used to build ubuntu packages with `wllvm`, a the whole-program LLVM wrapper. Our later stages use `wllvm` to extract LLVM bitcode from installed packages.
+* `ampfuzz:fuzzer`: includes the fuzzer and required instrumentation tools.
+* `ampfuzz:symbolic_execution`: includes the symcc symbolic execution engine, and is used to instrument targets and replay the amplification inputs to collect path constraints.
 
-## Building a target
-First build your program into a bitcode file using `clang` (e.g., base64.bc). Then build your target in the same way, but with your selected sanitizer enabled. To get a single bitcode file for larger projects, the easiest solution is to use [gllvm](https://github.com/SRI-CSL/gllvm).
-
+### 2. Prepare Evaluation Directory
+from the `eval` subdirectory, run
 ```bash
-# Build the bitcode files for target acquisition
-USE_FAST=1 $(pwd)/bin/angora-clang -emit-llvm -o base64.fast.bc -c base64.bc
-USE_FAST=1 $(pwd)/bin/angora-clang -fsanitize=address -emit-llvm -o base64.fast.asan.bc -c base64.bc
-# Build the actual binaries to be fuzzed
-USE_FAST=1 $(pwd)/bin/angora-clang -o base64.fast -c base64.bc
-USE_TRACK=1 $(pwd)/bin/angora-clang -o base64.track -c base64.bc
+make
 ```
 
-Then acquire the targets using:
-```bash
-bin/llvm-diff-parmesan -json base64.fast.bc base64.fast.asan.bc
+This will generate a fresh evaluation directory in `eval/04_create_eval_dir/eval`.
+The resulting directory can be moved around freely and should contain everything required to proceed.
+
+#### 2.1 Adjust eval parameters
+Evaluation is controlled by two files, `args` and `fuzz_all.sh`.
+`args` contains the different fuzzing configurations, one per line, in the following format
 ```
-
-This will output a file `targets.json`, which you provide to ParmeSan with the `-c` flag.
-
-For example:
-```bash
-$(pwd)/bin/fuzzer -c ./targets.json -i in -o out -t ./base64.track -- ./base64.fast -d @@
+<output_directory> <timeout> [extra_args ...]
 ```
-
-## Options
-ParmeSan's SanOpt option can speed up the fuzzing process by dynamically
-switching over to a sanitized binary only once the fuzzer reaches one of the
-targets specified in the `targets.json` file.
-
-Enable using the `-s [SANITIZED_BIN]` option.
-
-Build the sanitized binary in the following way:
-```bash
-USE_FAST=1 $(pwd)/bin/angora-clang -fsanitize=address -o base64.asan.fast -c base64.bc
+E.g., the two lines
 ```
-
-## Targets input file
-The targets input file consisit of a JSON file with the following format:
-```json
-{
-  "targets":  [1,2,3,4],
-  "edges":   [[1,2], [2,3]],
-  "callsite_dominators": {"1": [3,4,5]}
-}
-``` 
-
-Where the targets denote the identify of the cmp instruction to target (i.e., the id assigned by the `__angora_trace_cmp()` calls) and edges is the overlay graph of cmp ids (i.e., which cmps are connected to each other). The `edges` filed can be empty, since ParmeSan will add newly discovered edges automatically, but note that the performance will be better if you provide the static CFG.
-
-It is also possible to run ParmeSan in pure directed mode (`-D` option),
-meaning that it will only consider new seeds if the seed triggers coverage that
-is on a direct path to one of the specified targets. Note that this requires a
-somewhat complete static CFG to work (an incomplete CFG might contain no paths
-to the targets at all, which would mean that no new coverage will be considered
-at all).
-
-![ParmeSan Screenshot](/misc/screenshot.png)
-
-## How to get started
-Have a look at [BUILD_TARGET.md](/BUILD_TARGET.md) for a step-by-step tutorial on how to get started fuzzing with ParmeSan.
-
-## FAQ
-
-* Q: I get a warning like `==1561377==WARNING: DataFlowSanitizer: call to uninstrumented function gettext` when running the (track) instrumented program.
-* A: In many cases you can ignore this, but it will lose the taint (meaning worse performance). You need to add the function to the abilist (e.g., `llvm_mode/dfsan_rt/dfsan/done_abilist.txt`) and add a custom DFSan wrapper (in `llvm_mode/dfsan_rt/dfsan/dfsan_custom.cc`). See the [Angora documentation](https://github.com/AngoraFuzzer/Angora/blob/master/docs/example.md) for more info.
-* Q: I get an compiler error when building the track binary.
-* A: ParmeSan/ Angora uses DFSan for dynamic data-flow analysis. In certain cases building target applications can be a bit tricky (especially in the case of C++ targets). Make sure to disable as much inline assembly as possible and make sure that you link the correct libraries/ llvm libc++. Some programs also do weird stuff like an indirect call to a vararg function. This is not supported by DFSan at the moment, so the easy solution is to patch out these calls, or do something like [indirect call promotion](https://llvm.org/devmtg/2015-10/slides/Baev-IndirectCallPromotion.pdf).
-* Q: `llvm-diff-parmesan` generates too many targets!
-* A: You can do target pruning using the scripts in `tools/` (in particular `tools/prune.py`) or use [ASAP](https://github.com/dslab-epfl/asap) to generate a target bitcode file with fewer sanitizer targets.
-
-## Docker image
-You can also get the pre-built docker image of ParmeSan.
-
-```bash
-docker pull vusec/parmesan
-docker run --rm -it vusec/parmesan
-# In the container you can build objdump
-/parmesan/misc/build_objdump.sh
+1h 1h
+1h_100ms 1h -a=--disable_listen_ready -a=--early_termination=none -a=--startup_time_limit=100000 -a=--response_time_limit=100000
 ```
+will run 
+1. a default configuration for one hour and store the results into directory `1h`
+2. a configuration with a static timeout of 100ms and store the results into directory `1h_100ms`
+
+The `fuzz_all.sh` script further specifies how often each experiment should be repeated.
+This is controlled with the `N_RUNS` variable (defaults to `5`).
+
+### 3. Fuzz 
+Running `fuzz_all.sh` will now
+1. use the generated `Makefile` to prepare all targets for fuzzing (i.e., building and instrumenting the target into individual docker images)
+2. fuzz each target with each configuration and collect all results into a new `results` directory
+3. run the paths-to-message deduplication script.
+   This script collects all unique "paths" found during fuzzing and executes them against the dataflow-instrumented target binary, collecting only request-dependent CFG edges.
+
+For each target and run, a new subfolder will be created of the form `results/<pkg>/<binary>_<port>/<run>`.
+
+### 4. Analyze results
+Once fuzzing and path-deduplication has completed, the new `results` directory can be analyzed:
+1. `eval_scripts/01_compute_amp_stats.py` will extract final stats for each run into a file `results/results.json`
+2. `eval_scripts/02_print_table.py` will generate latex code for the overview table shown in the paper
+3. `eval_scripts/03_plot_grid.py` will generate the plots to show the results of different timeouts and amplification maximization runs
+
+### (optional) 5. generate honeypot code
+Run constraint-collection for a run folder (`results/<pkg>/<binary>_<port>/<config>/<run>`) and convert the collected constraints to python code:
+1. `bash hpsynth_scripts/synth_one.sh <run_folder>` will create a constraints file named `hpsynth/sym.result` in the run folder.
+2. `python hpsynth_scripts/main.py <sym.result>` will output python code for a number of `check` and `output` functions, along with a combined `gen_reply` function.
+
+(Honeypot-skeleton for listening on ports and providing rate-limiting is not provided with this project)

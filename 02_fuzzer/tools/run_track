@@ -1,0 +1,17 @@
+#!/bin/bash
+set -eu
+
+track_binary=$1
+port=$2
+input=$3
+
+track_binary=$(readlink -f ${track_binary})
+input=$(readlink -f ${input})
+
+tmp_fifo=$(mktemp -u)
+ANGORA_TRACK_PATH=${tmp_fifo} ANGORA_FUZZ_PORT=${port} ${track_binary}&
+track_pid=$!
+nc -u 127.0.0.1 ${port} < ${input} >track.out&
+wait ${track_pid}
+kill $(jobs -p)
+rm ${tmp_fifo}

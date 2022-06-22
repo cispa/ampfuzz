@@ -1,0 +1,7 @@
+[submodule "llvm"]
+	path = llvm
+	url = https://github.com/llvm/llvm-project.git
+[submodule "03_symbolic_execution/symcc_amp"]
+	path = 03_symbolic_execution/symcc_amp
+	url = https://github.com/nescio007/symcc_amp.git
+	branch = ampfuzz

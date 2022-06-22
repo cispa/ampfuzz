@@ -1,0 +1,257 @@
+#!/bin/bash
+set -eux
+
+PARMESAN_BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+
+STANDARD_LIBS="linux-vdso|libc|libdl|librt|ld-linux-.*|libz|libm|libpthread|libgcc_s"
+
+LIBMODE=false
+
+extra_abi=()
+
+while [ $# -gt 1 ]; do
+  case $1 in
+  -l | --lib)
+    LIBMODE=true
+    ;;
+  -a | --abi)
+    extra_abi+=("$2")
+    shift 1
+    ;;
+  *)
+    echo "Unknown argument $1, ignoring"
+    ;;
+  esac
+  shift 1
+done
+
+input_file=$1
+bitcode="${input_file}.bc"
+bitcode_unfolded="${input_file}.unfold.bc"
+bitcode_fast="${input_file}.fast.bc"
+bitcode_track="${input_file}.track.bc"
+
+extra_abi_dir="$(dirname ${input_file})/abi"
+
+output_fast="${input_file}.fast"
+output_track="${input_file}.track"
+
+targets_file="${input_file}.targets.json"
+
+extract-bc -o "${bitcode}" "${input_file}"
+
+if ! [ -f "${bitcode}" ]; then
+  echo >&2 "Cannot extract bitcode from ${input_file}"
+  exit 1
+fi
+
+# ================
+# Generate abilists
+# ================
+
+mkdir -p ${extra_abi_dir}
+
+extra_runtime=""
+extra_link=""
+extra_link_fast=""
+extra_link_track=""
+extra_targets=""
+
+for lib in $(ldd ${input_file} | sed -n -E 's/^.*=>\s*(\S+)\s.*$/\1/;T;p'); do
+  libname=$(basename "${lib}")
+  echo "Checking dependency ${libname} (${lib})"
+  if ([ -f "${lib}.fast" ] && [ -f "${lib}.track" ] && [ -f "${lib}.targets.json" ]) || ${PARMESAN_BASE}/make_target -l "${lib}"; then
+    extra_link_fast="${extra_link_fast} -l:${libname}.fast"
+    extra_link_track="${extra_link_track} -l:${libname}.track"
+    extra_targets="${extra_targets} ${lib}.targets.json"
+  else
+    extra_link="${extra_link} -l:${libname}"
+    if ! [[ ${libname} =~ ^(${STANDARD_LIBS})\. ]]; then
+      extra_abi_file="${extra_abi_dir}/${libname}.txt"
+      ${PARMESAN_BASE}/gen_library_abilist.sh "${lib}" functional >"${extra_abi_file}"
+      extra_abi+=("${extra_abi_file}")
+    elif [[ ${libname} =~ ^libz\. ]]; then
+      extra_abi+=("${PARMESAN_BASE}/rules/zlib_abilist.txt")
+      extra_runtime="${extra_runtime} ${PARMESAN_BASE}/lib/libZlibRt.a"
+    else
+      echo "Matches standard libs"
+    fi
+  fi
+done
+
+merged_abi_file=$(mktemp)
+if [ ${#extra_abi[@]} -gt 0 ]; then
+  cat "${extra_abi[@]}" | sort -u >"${merged_abi_file}"
+else
+  #create empty file if no extra ABI files needed...
+  echo "" >"${merged_abi_file}"
+fi
+
+exclude_abi_file=$(mktemp)
+${PARMESAN_BASE}/gen_library_abilist.sh "${input_file}" functional | sort -u >"${exclude_abi_file}"
+
+extra_abi="${input_file}.abilist.txt"
+comm -23 "${merged_abi_file}" "${exclude_abi_file}" >"${extra_abi}"
+
+# ================
+# Instrumentation
+# ================
+# Step1: Unfolding and ID-Assignment
+base_id=$(md5sum "${bitcode}" | sed -n 's/^\([0-9a-fA-F]\{16\}\).*$/0x\1/;T;p')
+
+opt -load=${PARMESAN_BASE}/pass/libUnfoldBranchPass.so \
+  -unfold_branch_pass \
+  -load=${PARMESAN_BASE}/pass/libIDPass.so \
+  -ID_llvm_pass \
+  --base_id=${base_id} \
+  -o "${bitcode_unfolded}" "${bitcode}"
+
+# Step2: Fast_Mode
+opt -load=${PARMESAN_BASE}/pass/libAngoraPass.so \
+  -angora_llvm_pass \
+  -angora-dfsan-abilist=${PARMESAN_BASE}/rules/angora_abilist.txt \
+  -angora-dfsan-abilist=${PARMESAN_BASE}/rules/dfsan_abilist.txt \
+  -angora-dfsan-abilist="${extra_abi}" \
+  -angora-exploitation-list=${PARMESAN_BASE}/rules/exploitation_list.txt \
+  -o "${bitcode_fast}" "${bitcode_unfolded}"
+
+# Step3: Track_Mode (and targets.json)
+opt -load=${PARMESAN_BASE}/pass/libAngoraPass.so \
+  -angora_llvm_pass \
+  -TrackMode \
+  -cfg-out "${targets_file}" \
+  -angora-dfsan-abilist=${PARMESAN_BASE}/rules/angora_abilist.txt \
+  -angora-dfsan-abilist=${PARMESAN_BASE}/rules/dfsan_abilist.txt \
+  -angora-dfsan-abilist="${extra_abi}" \
+  -angora-exploitation-list=${PARMESAN_BASE}/rules/exploitation_list.txt \
+  -load=${PARMESAN_BASE}/pass/libDFSanPass.so \
+  -dfsan_pass \
+  -angora-dfsan-abilist2=${PARMESAN_BASE}/rules/angora_abilist.txt \
+  -angora-dfsan-abilist2=${PARMESAN_BASE}/rules/dfsan_abilist.txt \
+  -angora-dfsan-abilist2="${extra_abi}" \
+  -o "${bitcode_track}" "${bitcode_unfolded}"
+
+# ================
+# Compilation/Linking
+# ================
+# TODO: Link correct libstdc++
+# TODO: Only link libstdc++ when necessary
+
+compiler=$(which clang)
+# Step1: find link-paths from original
+extra_linkpath=$(readelf -d "${input_file}" | sed -n 's/^.*(\(RUNPATH\|RPATH\)).*\[\(.*\)]$/\2/g;T;p' | sed 's/:/\n/g' | sed 's/^/-L/g' | xargs)
+extra_rpath=$(readelf -d "${input_file}" | sed -n 's/^.*(\(RUNPATH\|RPATH\)).*\[\(.*\)]$/\2/g;T;p' | sed 's/:/\n/g' | sed 's/^/-Wl,-rpath=/g' | xargs)
+
+# Step2: Adjust extra_link and set compiler
+if [[ "${extra_link}" == *"c++"* ]]; then
+  extra_link="-stdlib=libc++ -Wl,--start-group -lc++ -lc++abi -Wl,--end-group ${extra_link}"
+  compiler=$(which clang++)
+else
+  extra_link="${extra_link} -lc++ -lc++abi -lstdc++"
+fi
+
+extra_link="${extra_linkpath} ${extra_link} ${extra_rpath}"
+
+if [ ${LIBMODE} = false ]; then
+
+  # Step2: Fast_Mode
+  ${compiler} -o "${output_fast}" "${bitcode_fast}" \
+    -pie \
+    -fpic \
+    -Qunused-arguments \
+    -g \
+    -O3 \
+    -funroll-loops \
+    ${PARMESAN_BASE}/lib/libruntime_fast.a \
+    -Wl,--no-as-needed \
+    -Wl,--gc-sections \
+    -ldl \
+    -lrt \
+    -lpthread \
+    -lm \
+    -L${PARMESAN_BASE}/lib/libcxx_fast/ \
+    -lsystemd \
+    ${extra_link} \
+    ${extra_link_fast} \
+    -Wl,-export-dynamic
+
+  # Step3: Track_Mode
+  # We really would like to have -O3, but with llvm-11 some tail-call optimization breaks
+  # correct passing of the taint labels for -O2 and -O3, so only use -O1 for now.
+  ${compiler} -o "${output_track}" "${bitcode_track}" \
+    -pie \
+    -fpic \
+    -Qunused-arguments \
+    -g \
+    -O1 \
+    -funroll-loops \
+    -Wl,--whole-archive ${PARMESAN_BASE}/lib/libdfsan_rt-x86_64.a \
+    -Wl,--no-whole-archive \
+    -Wl,--dynamic-list=${PARMESAN_BASE}/lib/libdfsan_rt-x86_64.a.syms \
+    -lrt \
+    -Wl,--no-as-needed \
+    -Wl,--gc-sections \
+    -ldl \
+    -lrt \
+    -lpthread \
+    -lm \
+    -L${PARMESAN_BASE}/lib/libcxx_track/ \
+    -lsystemd \
+    ${extra_link} \
+    ${extra_link_track} \
+    -lc++ \
+    -lc++abi \
+    ${extra_runtime} \
+    ${PARMESAN_BASE}/lib/libDFSanIO.a \
+    ${PARMESAN_BASE}/lib/libruntime.a \
+    -Wl,-export-dynamic
+
+else
+  # Step2: Fast_Mode
+  ${compiler} -o "${output_fast}" "${bitcode_fast}" \
+    -shared \
+    -fpic \
+    -Qunused-arguments \
+    -g \
+    -O3 \
+    -funroll-loops \
+    -Wl,--no-as-needed \
+    -Wl,--gc-sections \
+    -ldl \
+    -lrt \
+    -lpthread \
+    -lm \
+    -L${PARMESAN_BASE}/lib/libcxx_fast/ \
+    -lsystemd \
+    ${extra_link} \
+    ${extra_link_fast} \
+    -Wl,-export-dynamic
+
+  # Step3: Track_Mode
+  # We really would like to have -O3, but with llvm-11 some tail-call optimization breaks
+  # correct passing of the taint labels for -O2 and -O3, so only use -O1 for now.
+  ${compiler} -o "${output_track}" "${bitcode_track}" \
+    -shared \
+    -fpic \
+    -Qunused-arguments \
+    -g \
+    -O1 \
+    -funroll-loops \
+    -lrt \
+    -Wl,--no-as-needed \
+    -Wl,--gc-sections \
+    -ldl \
+    -lrt \
+    -lpthread \
+    -lm \
+    -L${PARMESAN_BASE}/lib/libcxx_track/ \
+    -lsystemd \
+    ${extra_link} \
+    ${extra_link_track} \
+    -lc++ \
+    -lc++abi \
+    ${extra_runtime} \
+    -Wl,-export-dynamic
+fi
+
+${PARMESAN_BASE}/merge_targets.py "${targets_file}" ${extra_targets}

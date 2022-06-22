@@ -1,0 +1,37 @@
+#!/bin/bash
+set -eu
+
+SCRIPT_BASE="$( cd "$(dirname "$( readlink -f "${BASH_SOURCE[0]}" )" )" >/dev/null 2>&1 && pwd )"
+
+# always enable position-independent code
+# otherwise taint-tracking might fail later-on
+extra_args=" -Qunused-arguments -pie -fpic"
+
+# fix build issues for older packages by re-enabling the old default of "-fcommon"
+# if neither -fcommon nor -fno-common are specified
+if [[ ! $@ =~ -f(no-)?common ]]
+then
+  extra_args+=" -fcommon"
+fi
+
+# wllvm fails to parse -oOUTPUT.o,
+# we therefore add an extra space here,
+# unless it is one of clangs -objcmt-* flags
+#
+# also skip -fgnu89-inline arguments that are 
+# incompatible with c++ (g++ only shows a warning, but clang will fail)
+args=()
+for arg in "$@"
+do
+        if [[ $arg =~ ^-o.+$ ]] && ! [[ $arg =~ ^-objcmt.+$ ]]
+        then
+                args+=("-o" "${arg:2}")
+        elif [[ $arg =~ ^-fgnu89-inline$ ]] || [[ $arg =~ ^-Werror$ ]]
+        then
+            : # skip -fgnu89-inline and -Werror arguments
+        else
+                args+=("$arg")
+        fi
+done
+
+LLVM_COMPILER=clang LLVM_COMPILER_PATH="@LLVM_COMPILER_PATH@" wllvm++ $extra_args -stdlib=libc++ -nostdinc++ -I"${SCRIPT_BASE}/include/c++/v1" -L"${SCRIPT_BASE}/lib/libcxx" -Wl,-rpath,"${SCRIPT_BASE}/lib/libcxx" "${args[@]}" -lc++ -lc++abi -lpthread
