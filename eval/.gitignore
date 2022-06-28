@@ -2,7 +2,6 @@
 01_collect_targets/patterns.csv
 01_collect_targets/patterns.txt
 01_collect_targets/refpolicy/
-02_filter_matches/filter_matches.sh
 02_filter_matches/matches.txt
 02_filter_matches/old_matches.txt
 03_join_matches/by_inst
