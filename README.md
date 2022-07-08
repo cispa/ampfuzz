@@ -61,8 +61,9 @@ Once fuzzing and path-deduplication has completed, the new `results` directory c
 3. `eval_scripts/03_plot_grid.py` will generate the plots to show the results of different timeouts and amplification maximization runs
 
 ### (optional) 5. generate honeypot code
-Run constraint-collection for a run folder (`results/<pkg>/<binary>_<port>/<config>/<run>`) and convert the collected constraints to python code:
-1. `bash hpsynth_scripts/synth_one.sh <run_folder>` will create a constraints file named `hpsynth/sym.result` in the run folder.
-2. `python hpsynth_scripts/main.py <sym.result>` will output python code for a number of `check` and `output` functions, along with a combined `gen_reply` function.
+Prepare a target for symbolic execution, run constraint-collection for a run folder (`results/<pkg>/<binary>_<port>/<config>/<run>`), and convert the collected constraints to python code:
+1. `make targets/<pkg>/.sym_config_<path>_<port>.iid` will build a docker-container and instrumenting the target for symbolic execution.
+2. `bash hpsynth_scripts/synth_one.sh <run_folder>` will create a constraints file named `hpsynth/sym.result` in the run folder.
+3. `python hpsynth_scripts/main.py <sym.result>` will output python code for a number of `check` and `output` functions, along with a combined `gen_reply` function.
 
 (Honeypot-skeleton for listening on ports and providing rate-limiting is not provided with this project)
